@@ -26,12 +26,15 @@ import gc # Garbage collector for clearing cache
 AVAILABLE_MODELS = {
     # Replace with models you have access to and resources for
     # Add more models here
-    'phi3:mini': 'phi3:mini',
-    'phi3:mini:latest': 'phi3:mini'  # Add :latest variant
+    'distilgpt2': 'distilgpt2',
+    'distilgpt2:latest': 'distilgpt2'  # Add :latest variant
 }
 
 # Global storage for loaded models and tokenizers
 loaded_models: Dict[str, Dict[str, Any]] = {}
+
+# Global variable for distilgpt2 model
+DISTILGPT2_MODEL: Dict[str, Any] = None
 
 # --- Pydantic Models (Matching Ollama Spec) ---
 
@@ -150,7 +153,7 @@ def load_model(model_name: str):
     #     return loaded_models[model_name]
 
     hf_identifier = 'distilgpt2' # AVAILABLE_MODELS[base_name]
-    print(f"Loading model: {model_name} ({hf_identifier})...")
+    print(f"Loading model: {base_name} ({hf_identifier})...")
     start_time = time.time()
 
     try:
@@ -240,10 +243,19 @@ async def redirect_ollama_port(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup_event():
+    # Load distilgpt2 model on startup
+    global DISTILGPT2_MODEL
+    try:
+        DISTILGPT2_MODEL = load_model('distilgpt2')
+        print("Successfully loaded distilgpt2 model")
+    except Exception as e:
+        print(f"Failed to load distilgpt2 model: {e}")
+        raise e
+
     # Pre-load models on startup (optional, can load on first request too)
     for name in AVAILABLE_MODELS.keys():
         try:
-            #load_model(name)
+            load_model(name)
             print(f"Successfully pre-loaded: {name}")
         except Exception as e:
             print(f"Failed to pre-load model {name}: {e}")
@@ -392,7 +404,7 @@ async def generate_stream_response(
                         done=False
                     )
                 
-                yield f"data: {response.model_dump_json()}\n\n"
+                yield f"{response.model_dump_json()}\r\n"
 
     except Exception as e:
         print(f"Error receiving from streamer: {e}")
@@ -437,7 +449,7 @@ async def generate_stream_response(
                 eval_count=eval_count
             )
         
-        yield f"{final_response.model_dump_json()}\n\n"
+        yield f"{final_response.model_dump_json()}\r\n"
 
 async def generate_non_stream_response(
      request: Union[GenerationRequest, ChatRequest],
@@ -591,46 +603,117 @@ async def generate_chat_completion(request: ChatRequest, http_request: Request):
     if not request.messages:
          raise HTTPException(status_code=400, detail="Messages are required for /api/chat")
 
-    model_name = request.model
+    # Use the globally loaded distilgpt2 model
+    global DISTILGPT2_MODEL
+    if DISTILGPT2_MODEL is None:
+        raise HTTPException(status_code=500, detail="Model not loaded") # TODO: Remove this
+        
+    model = DISTILGPT2_MODEL["model"]
+    tokenizer = DISTILGPT2_MODEL["tokenizer"]
+    model_name = 'distilgpt2'
+    device = model.device
+
+    if isinstance(request, ChatRequest):
+        input_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in (request.messages or [])])
+        input_text += "\nassistant:"
+    else:
+        input_text = request.prompt
+        if request.system:
+            input_text = f"System: {request.system}\nUser: {request.prompt}"
+
+    model_inputs = tokenizer(input_text, return_tensors="pt").to(device)
+    generation_kwargs = prepare_generation_kwargs(request, tokenizer)
+
+    streamer = TextIteratorStreamer(
+        tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+
+    generation_thread = threading.Thread(
+        target=model.generate,
+        kwargs=dict(**model_inputs, streamer=streamer, **generation_kwargs),
+    )
+    generation_thread.start()
+
+    start_time_ns = time.time_ns()
+    load_duration_ns = time.time_ns()
 
     if request.stream:
         async def generate_stream():
-            # Mock response chunks
-            mock_responses = [
-                {"content": "The", "done": False},
-                {"content": " word", "done": False},
-                {"content": "ob", "done": False},
-                {"content": "", "done": True, "done_reason": "stop"}
-            ]
+            generated_text = ""
+            output_token_ids = []
+            eval_count = 0
             
-            for i, chunk in enumerate(mock_responses):
-                # Simulate some delay between chunks
-                if i < len(mock_responses) - 1:
-                    await asyncio.sleep(0.5)
+            try:
+                # Create a queue to handle the stream
+                queue = asyncio.Queue()
+                loop = asyncio.get_event_loop()
                 
-                response = {
+                def put_in_queue():
+                    for text in streamer:
+                        future = asyncio.run_coroutine_threadsafe(queue.put(text), loop)
+                        future.result()  # Wait for the put to complete
+                    future = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+                    future.result()  # Wait for the final put to complete
+                
+                # Start the generation in a separate thread
+                threading.Thread(target=put_in_queue, daemon=True).start()
+                
+                # Process the stream
+                while True:
+                    new_text = await queue.get()
+                    if new_text is None:
+                        break
+                        
+                    if new_text:
+                        created_at = datetime.utcnow().isoformat() + "Z"
+                        generated_text += new_text
+                        eval_count += 1
+
+                        new_token_ids = tokenizer.encode(new_text, add_special_tokens=False)
+                        output_token_ids.extend(new_token_ids)
+
+                        response = {
+                            "model": model_name,
+                            "created_at": created_at,
+                            "message": {
+                                "role": "assistant",
+                                "content": new_text
+                            },
+                            "done": False
+                        }
+                        
+                        yield f"{json.dumps(response)}\r\n"
+
+                # Send final response with statistics
+                total_duration_ns = time.time_ns() - start_time_ns
+                prompt_eval_count = model_inputs["input_ids"].shape[-1]
+                
+                final_response = {
                     "model": model_name,
                     "created_at": datetime.utcnow().isoformat() + "Z",
                     "message": {
                         "role": "assistant",
-                        "content": chunk["content"]
+                        "content": ""
                     },
-                    "done": chunk["done"]
+                    "done": True,
+                    "done_reason": "stop",
+                    "total_duration": total_duration_ns,
+                    "load_duration": 8305200,
+                    "prompt_eval_count": prompt_eval_count,
+                    "prompt_eval_duration": 344353100,
+                    "eval_count": eval_count,
+                    "eval_duration": total_duration_ns - 8305200
                 }
                 
-                # Add final statistics to the last chunk
-                if chunk["done"]:
-                    response.update({
-                        "done_reason": "stop",
-                        "total_duration": 3020862700,
-                        "load_duration": 8305200,
-                        "prompt_eval_count": 39,
-                        "prompt_eval_duration": 344353100,
-                        "eval_count": 111,
-                        "eval_duration": 2658950700
-                    })
-                
-                yield f"{json.dumps(response)}\r\n"
+                yield f"{json.dumps(final_response)}\r\n"
+
+            except Exception as e:
+                print(f"Error during generation: {e}")
+                error_response = {
+                    "error": f"Generation failed: {e}",
+                    "done": True
+                }
+                yield f"{json.dumps(error_response)}\r\n"
 
         return StreamingResponse(
             generate_stream(),
@@ -644,22 +727,33 @@ async def generate_chat_completion(request: ChatRequest, http_request: Request):
         )
     else:
         # Non-streaming response
-        return {
-            "model": model_name,
-            "created_at": datetime.utcnow().isoformat() + "Z",
-            "message": {
-                "role": "assistant",
-                "content": "The word \"ob\""
-            },
-            "done": True,
-            "done_reason": "stop",
-            "total_duration": 3020862700,
-            "load_duration": 8305200,
-            "prompt_eval_count": 39,
-            "prompt_eval_duration": 344353100,
-            "eval_count": 111,
-            "eval_duration": 2658950700
-        }
+        try:
+            with torch.no_grad():
+                outputs = model.generate(**model_inputs, **generation_kwargs)
+
+            total_duration_ns = time.time_ns() - start_time_ns
+            input_length = model_inputs["input_ids"].shape[1]
+            output_token_ids = outputs[0][input_length:].tolist()
+            response_text = tokenizer.decode(output_token_ids, skip_special_tokens=True)
+            
+            return {
+                "model": model_name,
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "message": {
+                    "role": "assistant",
+                    "content": response_text
+                },
+                "done": True,
+                "done_reason": "stop",
+                "total_duration": total_duration_ns,
+                "load_duration": 0,
+                "prompt_eval_count": input_length,
+                "prompt_eval_duration": 0,  # TODO: Calculate actual duration
+                "eval_count": len(output_token_ids),
+                "eval_duration": total_duration_ns - 0
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
 
 @app.get("/")
 async def read_root():
