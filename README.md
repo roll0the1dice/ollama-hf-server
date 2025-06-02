@@ -14,8 +14,22 @@
 ## 环境要求
 
 - Python 3.8+
-- CUDA 支持（可选，用于 GPU 加速）
+- CUDA 12.7
+- NVIDIA Driver 566.14+
 - 至少 4GB 显存（使用 GPU 时）
+
+## 依赖版本
+
+主要依赖包版本：
+```
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121
+transformers>=4.37.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.6.0
+```
 
 ## 安装
 
@@ -27,6 +41,10 @@ cd ollama
 
 2. 安装依赖：
 ```bash
+# 安装 PyTorch (CUDA 12.1)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# 安装其他依赖
 pip install -r requirements.txt
 ```
 
@@ -52,13 +70,45 @@ python main.py
 
 ## 与 Open WebUI 集成
 
-1. 安装 Open WebUI：
+### 方法一：使用 Docker（推荐）
+
+1. 如果 Ollama 在同一台机器上：
 ```bash
-docker run -d --name open-webui -p 3000:8080 -e OLLAMA_API_BASE_URL=http://host.docker.internal:11434/api ghcr.io/open-webui/open-webui:main
+docker run -d -p 3000:8080 --add-host=host.docker.internal:host-gateway -v open-webui:/app/backend/data --name open-webui --restart always ghcr.io/open-webui/open-webui:main
 ```
 
-2. 访问 Open WebUI：
-打开浏览器访问 `http://localhost:3000`
+2. 如果 Ollama 在其他服务器上：
+```bash
+docker run -d -p 3000:8080 -e OLLAMA_BASE_URL=https://example.com -v open-webui:/app/backend/data --name open-webui --restart always ghcr.io/open-webui/open-webui:main
+```
+
+3. 如果需要 GPU 支持：
+```bash
+docker run -d -p 3000:8080 --gpus all --add-host=host.docker.internal:host-gateway -v open-webui:/app/backend/data --name open-webui --restart always ghcr.io/open-webui/open-webui:cuda
+```
+
+### 方法二：使用 Python pip
+
+1. 确保使用 Python 3.11
+2. 安装 Open WebUI：
+```bash
+pip install open-webui
+```
+3. 运行 Open WebUI：
+```bash
+open-webui serve
+```
+
+### 访问 Open WebUI
+
+安装完成后，打开浏览器访问 `http://localhost:3000`
+
+### 故障排除
+
+如果遇到连接问题，可以尝试使用 `--network=host` 参数：
+```bash
+docker run -d --network=host -v open-webui:/app/backend/data -e OLLAMA_BASE_URL=http://127.0.0.1:11434 --name open-webui --restart always ghcr.io/open-webui/open-webui:main
+```
 
 ## API 接口
 
@@ -89,6 +139,7 @@ docker run -d --name open-webui -p 3000:8080 -e OLLAMA_API_BASE_URL=http://host.
 - 确保有足够的 GPU 显存（如果使用 GPU）
 - 建议使用虚拟环境运行
 - 生产环境部署时注意配置安全设置
+- 确保 CUDA 版本与 PyTorch 版本匹配
 
 ## 许可证
 
