@@ -1,5 +1,9 @@
 # main.py
 import os
+# Set CUDA debugging environment variables
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
 import time
 import json
 import torch
@@ -26,15 +30,15 @@ import gc # Garbage collector for clearing cache
 AVAILABLE_MODELS = {
     # Replace with models you have access to and resources for
     # Add more models here
-    'distilgpt2': 'distilgpt2',
-    'distilgpt2:latest': 'distilgpt2'  # Add :latest variant
+    'deepseek': 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
+    'deepseek:latest': 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',  # Add :latest variant
 }
 
 # Global storage for loaded models and tokenizers
 loaded_models: Dict[str, Dict[str, Any]] = {}
 
-# Global variable for distilgpt2 model
-DISTILGPT2_MODEL: Dict[str, Any] = None
+# Global variable for deepseek model
+DEEPSEEK_MODEL: Dict[str, Any] = None
 
 # --- Pydantic Models (Matching Ollama Spec) ---
 
@@ -147,30 +151,58 @@ def load_model(model_name: str):
     # Handle :latest suffix
     base_name = model_name.split(':')[0] if ':' in model_name else model_name
     
-    # if model_name not in AVAILABLE_MODELS:
-    #     raise HTTPException(status_code=404, detail=f"Model '{model_name}' not available.")
-    # if model_name in loaded_models:
-    #     return loaded_models[model_name]
-
-    hf_identifier = 'distilgpt2' # AVAILABLE_MODELS[base_name]
+    # Check if model exists in AVAILABLE_MODELS
+    if base_name not in AVAILABLE_MODELS:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not available.")
+    
+    hf_identifier = AVAILABLE_MODELS[base_name]
     print(f"Loading model: {base_name} ({hf_identifier})...")
     start_time = time.time()
 
     try:
         # Configure device (prefer CUDA if available)
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        torch_dtype = torch.float16 if device == "cuda" else torch.float32 # Use float16 on GPU
-
+        if device == "cuda":
+            # Clear GPU cache before loading
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # Print GPU memory info
+            print(f"GPU Memory before loading:")
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+        
+        # Use float16 for both CPU and CUDA
+        torch_dtype = torch.float16
+        
+        # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(hf_identifier)
-        model = AutoModelForCausalLM.from_pretrained(
-            hf_identifier,
-            torch_dtype=torch_dtype,
-            device_map="auto",  # Let accelerate handle device placement if multiple GPUs
-            # low_cpu_mem_usage=True, # May help on systems with low RAM
-            trust_remote_code=True # Be cautious with this
-            # Add quantization config here if needed (e.g., load_in_4bit=True requires bitsandbytes)
-        )
-        model.eval() # Set to evaluation mode
+        
+        # Load model with float16
+        if device == "cuda":
+            # For CUDA, use device_map="auto" to let accelerate handle device placement
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_identifier,
+                torch_dtype=torch_dtype,
+                device_map="auto",  # Let accelerate handle device placement
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+        else:
+            # For CPU, load normally and move to device
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_identifier,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+            model = model.to(device)
+        
+        model.eval()  # Set to evaluation mode
+
+        # Print model device placement
+        print(f"Model device: {next(model.parameters()).device}")
+        print(f"Model dtype: {next(model.parameters()).dtype}")
 
         # --- Get Model Details (Best Effort) ---
         try:
@@ -182,9 +214,7 @@ def load_model(model_name: str):
 
         hf_config = model.config
         parameters_str = get_model_config(hf_config)
-        quant_level = "FP16" if torch_dtype == torch.float16 else "FP32" # Basic guess
-        if hasattr(model, "quantization_method"): # For bitsandbytes etc.
-             quant_level = str(model.quantization_method)
+        quant_level = "FP16"  # Always FP16 since we're using float16
 
         details = ModelDetails(
             parameter_size=f"{hf_config.num_parameters / 1e9:.2f}B" if hasattr(hf_config, 'num_parameters') else "Unknown",
@@ -206,14 +236,22 @@ def load_model(model_name: str):
         }
         print(f"Model {model_name} loaded in {loaded_models[model_name]['load_time']:.2f}s")
         print(f"Estimated Size: {size_estimate / (1024**3):.2f} GB")
-        # Clear GPU cache after loading if using CUDA
+        
         if device == 'cuda':
+            print(f"GPU Memory after loading:")
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
             torch.cuda.empty_cache()
             gc.collect()
+            
         return loaded_models[model_name]
 
     except Exception as e:
         print(f"Error loading model {model_name}: {e}")
+        if device == "cuda":
+            print("Attempting to clear GPU memory...")
+            torch.cuda.empty_cache()
+            gc.collect()
         raise HTTPException(status_code=500, detail=f"Failed to load model {model_name}: {e}")
 
 
@@ -243,22 +281,37 @@ async def redirect_ollama_port(request: Request, call_next):
 
 @app.on_event("startup")
 async def startup_event():
-    # Load distilgpt2 model on startup
-    global DISTILGPT2_MODEL
+    # Print CUDA information
+    print("\n=== CUDA Information ===")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA device memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    print("=======================\n")
+
+    # Load deepseek model on startup
+    global DEEPSEEK_MODEL
     try:
-        DISTILGPT2_MODEL = load_model('distilgpt2')
-        print("Successfully loaded distilgpt2 model")
+        DEEPSEEK_MODEL = load_model('deepseek')
+        print("Successfully loaded deepseek model")
+        
+        # Set model to evaluation mode and disable gradient computation
+        DEEPSEEK_MODEL["model"].eval()
+        torch.set_grad_enabled(False)
+        
     except Exception as e:
-        print(f"Failed to load distilgpt2 model: {e}")
+        print(f"Failed to load deepseek model: {e}")
         raise e
 
     # Pre-load models on startup (optional, can load on first request too)
-    for name in AVAILABLE_MODELS.keys():
-        try:
-            load_model(name)
-            print(f"Successfully pre-loaded: {name}")
-        except Exception as e:
-            print(f"Failed to pre-load model {name}: {e}")
+    # for name in AVAILABLE_MODELS.keys():
+    #     if name != 'deepseek':  # Skip deepseek as it's already loaded
+    #         try:
+    #             load_model(name)
+    #             print(f"Successfully pre-loaded: {name}")
+    #         except Exception as e:
+    #             print(f"Failed to pre-load model {name}: {e}")
 
 
 # --- API Endpoints ---
@@ -360,6 +413,10 @@ async def generate_stream_response(
         input_text = request.prompt
         if request.system:
             input_text = f"System: {request.system}\nUser: {request.prompt}"
+
+    # Only tokenize if we have actual input
+    if not input_text.strip():
+        raise HTTPException(status_code=400, detail="Empty input text")
 
     model_inputs = tokenizer(input_text, return_tensors="pt").to(device)
 
@@ -601,159 +658,193 @@ async def generate_completion(request: GenerationRequest, http_request: Request)
 async def generate_chat_completion(request: ChatRequest, http_request: Request):
     """Generate chat completion based on message history (compatible with Ollama chat)."""
     if not request.messages:
-         raise HTTPException(status_code=400, detail="Messages are required for /api/chat")
+        raise HTTPException(status_code=400, detail="Messages are required for /api/chat")
+    
+    # Validate that the last message is from the user
+    if not request.messages or request.messages[-1]["role"] != "user":
+        raise HTTPException(status_code=400, detail="Last message must be from user")
 
-    # Use the globally loaded distilgpt2 model
-    global DISTILGPT2_MODEL
-    if DISTILGPT2_MODEL is None:
-        raise HTTPException(status_code=500, detail="Model not loaded") # TODO: Remove this
+    # Use the globally loaded deepseek model
+    global DEEPSEEK_MODEL
+    if DEEPSEEK_MODEL is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
         
-    model = DISTILGPT2_MODEL["model"]
-    tokenizer = DISTILGPT2_MODEL["tokenizer"]
-    model_name = 'distilgpt2'
+    model = DEEPSEEK_MODEL["model"]
+    tokenizer = DEEPSEEK_MODEL["tokenizer"]
+    model_name = 'deepseek'
     device = model.device
 
-    if isinstance(request, ChatRequest):
-        input_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in (request.messages or [])])
-        input_text += "\nassistant:"
-    else:
-        input_text = request.prompt
-        if request.system:
-            input_text = f"System: {request.system}\nUser: {request.prompt}"
-
-    model_inputs = tokenizer(input_text, return_tensors="pt").to(device)
-    generation_kwargs = prepare_generation_kwargs(request, tokenizer)
-
-    streamer = TextIteratorStreamer(
-        tokenizer, skip_prompt=True, skip_special_tokens=True
-    )
-
-    generation_thread = threading.Thread(
-        target=model.generate,
-        kwargs=dict(**model_inputs, streamer=streamer, **generation_kwargs),
-    )
-    generation_thread.start()
+    # Format input text with proper role markers
+    input_text = ""
+    for msg in request.messages:
+        if msg["role"] == "user":
+            input_text += f"User: {msg['content']}\n"
+        elif msg["role"] == "assistant":
+            input_text += f"Assistant: {msg['content']}\n"
+        elif msg["role"] == "system":
+            input_text += f"System: {msg['content']}\n"
+    
+    # Add the final assistant marker
+    input_text += "Assistant:"
 
     start_time_ns = time.time_ns()
-    load_duration_ns = time.time_ns()
 
-    if request.stream:
-        async def generate_stream():
-            generated_text = ""
-            output_token_ids = []
-            eval_count = 0
-            
+    try:
+        # Tokenize input
+        model_inputs = tokenizer(input_text, return_tensors="pt")
+        
+        # Move inputs to device safely
+        if device == "cuda":
             try:
-                # Create a queue to handle the stream
-                queue = asyncio.Queue()
-                loop = asyncio.get_event_loop()
-                
-                def put_in_queue():
-                    for text in streamer:
-                        future = asyncio.run_coroutine_threadsafe(queue.put(text), loop)
-                        future.result()  # Wait for the put to complete
-                    future = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-                    future.result()  # Wait for the final put to complete
-                
-                # Start the generation in a separate thread
-                threading.Thread(target=put_in_queue, daemon=True).start()
-                
-                # Process the stream
-                while True:
-                    new_text = await queue.get()
-                    if new_text is None:
-                        break
-                        
-                    if new_text:
-                        created_at = datetime.utcnow().isoformat() + "Z"
-                        generated_text += new_text
-                        eval_count += 1
+                model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+            except Exception as e:
+                print(f"Error moving inputs to CUDA: {e}")
+                print("Falling back to CPU")
+                device = "cpu"
+                model = model.to(device)
+                model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
+        else:
+            model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
 
-                        new_token_ids = tokenizer.encode(new_text, add_special_tokens=False)
-                        output_token_ids.extend(new_token_ids)
+        generation_kwargs = prepare_generation_kwargs(request, tokenizer)
 
-                        response = {
-                            "model": model_name,
-                            "created_at": created_at,
-                            "message": {
-                                "role": "assistant",
-                                "content": new_text
-                            },
-                            "done": False
-                        }
-                        
-                        yield f"{json.dumps(response)}\r\n"
+        if request.stream:
+            streamer = TextIteratorStreamer(
+                tokenizer, skip_prompt=True, skip_special_tokens=True
+            )
 
-                # Send final response with statistics
+            generation_thread = threading.Thread(
+                target=model.generate,
+                kwargs=dict(**model_inputs, streamer=streamer, **generation_kwargs),
+            )
+            generation_thread.start()
+
+            
+            load_duration_ns = time.time_ns()
+
+            async def generate_stream():
+                generated_text = ""
+                output_token_ids = []
+                eval_count = 0
+                
+                try:
+                    # Create a queue to handle the stream
+                    queue = asyncio.Queue()
+                    loop = asyncio.get_event_loop()
+                    
+                    def put_in_queue():
+                        for text in streamer:
+                            future = asyncio.run_coroutine_threadsafe(queue.put(text), loop)
+                            future.result()  # Wait for the put to complete
+                        future = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+                        future.result()  # Wait for the final put to complete
+                    
+                    # Start the generation in a separate thread
+                    threading.Thread(target=put_in_queue, daemon=True).start()
+                    
+                    # Process the stream
+                    while True:
+                        new_text = await queue.get()
+                        if new_text is None:
+                            break
+                            
+                        if new_text:
+                            created_at = datetime.utcnow().isoformat() + "Z"
+                            generated_text += new_text
+                            eval_count += 1
+
+                            new_token_ids = tokenizer.encode(new_text, add_special_tokens=False)
+                            output_token_ids.extend(new_token_ids)
+
+                            response = {
+                                "model": model_name,
+                                "created_at": created_at,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": new_text
+                                },
+                                "done": False
+                            }
+                            
+                            yield f"{json.dumps(response)}\r\n"
+
+                    # Send final response with statistics
+                    total_duration_ns = time.time_ns() - start_time_ns
+                    prompt_eval_count = model_inputs["input_ids"].shape[-1]
+                    
+                    final_response = {
+                        "model": model_name,
+                        "created_at": datetime.utcnow().isoformat() + "Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": ""
+                        },
+                        "done": True,
+                        "done_reason": "stop",
+                        "total_duration": total_duration_ns,
+                        "load_duration": 8305200,
+                        "prompt_eval_count": prompt_eval_count,
+                        "prompt_eval_duration": 344353100,
+                        "eval_count": eval_count,
+                        "eval_duration": total_duration_ns - 8305200
+                    }
+                    
+                    yield f"{json.dumps(final_response)}\r\n"
+
+                except Exception as e:
+                    print(f"Error during generation: {e}")
+                    error_response = {
+                        "error": f"Generation failed: {e}",
+                        "done": True
+                    }
+                    yield f"{json.dumps(error_response)}\r\n"
+
+            return StreamingResponse(
+                generate_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Content-Type": "text/event-stream",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+        else:
+            # Non-streaming response
+            try:
+                with torch.no_grad():
+                    outputs = model.generate(**model_inputs, **generation_kwargs)
+
                 total_duration_ns = time.time_ns() - start_time_ns
-                prompt_eval_count = model_inputs["input_ids"].shape[-1]
+                input_length = model_inputs["input_ids"].shape[1]
+                output_token_ids = outputs[0][input_length:].tolist()
+                response_text = tokenizer.decode(output_token_ids, skip_special_tokens=True)
                 
-                final_response = {
+                return {
                     "model": model_name,
                     "created_at": datetime.utcnow().isoformat() + "Z",
                     "message": {
                         "role": "assistant",
-                        "content": ""
+                        "content": response_text
                     },
                     "done": True,
                     "done_reason": "stop",
                     "total_duration": total_duration_ns,
-                    "load_duration": 8305200,
-                    "prompt_eval_count": prompt_eval_count,
-                    "prompt_eval_duration": 344353100,
-                    "eval_count": eval_count,
-                    "eval_duration": total_duration_ns - 8305200
+                    "load_duration": 0,
+                    "prompt_eval_count": input_length,
+                    "prompt_eval_duration": 0,
+                    "eval_count": len(output_token_ids),
+                    "eval_duration": total_duration_ns - 0
                 }
-                
-                yield f"{json.dumps(final_response)}\r\n"
-
             except Exception as e:
-                print(f"Error during generation: {e}")
-                error_response = {
-                    "error": f"Generation failed: {e}",
-                    "done": True
-                }
-                yield f"{json.dumps(error_response)}\r\n"
-
-        return StreamingResponse(
-            generate_stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Content-Type": "text/event-stream",
-                "X-Accel-Buffering": "no"
-            }
-        )
-    else:
-        # Non-streaming response
-        try:
-            with torch.no_grad():
-                outputs = model.generate(**model_inputs, **generation_kwargs)
-
-            total_duration_ns = time.time_ns() - start_time_ns
-            input_length = model_inputs["input_ids"].shape[1]
-            output_token_ids = outputs[0][input_length:].tolist()
-            response_text = tokenizer.decode(output_token_ids, skip_special_tokens=True)
-            
-            return {
-                "model": model_name,
-                "created_at": datetime.utcnow().isoformat() + "Z",
-                "message": {
-                    "role": "assistant",
-                    "content": response_text
-                },
-                "done": True,
-                "done_reason": "stop",
-                "total_duration": total_duration_ns,
-                "load_duration": 0,
-                "prompt_eval_count": input_length,
-                "prompt_eval_duration": 0,  # TODO: Calculate actual duration
-                "eval_count": len(output_token_ids),
-                "eval_duration": total_duration_ns - 0
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+    except Exception as e:
+        print(f"Error in chat completion: {e}")
+        if device == "cuda":
+            print("Attempting to clear GPU memory...")
+            torch.cuda.empty_cache()
+            gc.collect()
+        raise HTTPException(status_code=500, detail=f"Chat completion failed: {e}")
 
 @app.get("/")
 async def read_root():
