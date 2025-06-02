@@ -35,8 +35,8 @@ pydantic>=2.6.0
 
 1. 克隆仓库：
 ```bash
-git clone <repository-url>
-cd ollama
+git clone git@github.com:roll0the1dice/-ollama-hf-server.git
+cd -ollama-hf-server
 ```
 
 2. 安装依赖：
